@@ -1,0 +1,110 @@
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  getContentType,
+  downloadMediaMessage
+} = require("@whiskeysockets/baileys")
+
+const P = require("pino")
+const fs = require("fs")
+
+// 🔴 NUMBER TO MONITOR
+const MONITOR_JID = "923243252787@s.whatsapp.net"
+
+if (!fs.existsSync("./deleted")) fs.mkdirSync("./deleted")
+
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState("session")
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: P({ level: "silent" }),
+    printQRInTerminal: true
+  })
+
+  sock.ev.on("creds.update", saveCreds)
+
+  // CONNECTION
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update
+    if (connection === "open") console.log("✅ WhatsApp Connected")
+    if (connection === "close") {
+      if (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
+        startBot()
+      } else {
+        console.log("❌ Logged Out")
+      }
+    }
+  })
+
+  // MESSAGE HANDLER
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const msg = messages[0]
+    if (!msg.message || msg.key.fromMe) return
+
+    const jid = msg.key.remoteJid
+    const sender = msg.key.participant || jid
+    const mtype = getContentType(msg.message)
+
+    // 🔐 CONTACT MONITORING
+    if (sender === MONITOR_JID) {
+      await sock.sendMessage(sock.user.id, {
+        text: `👀 Monitored Message:\nFrom: ${sender}`
+      })
+    }
+
+    // 👋 AUTO GREETING
+    const text =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text
+
+    if (text?.toLowerCase() === "hi") {
+      await sock.sendMessage(jid, {
+        text: "👋 Hello!\nAnti-Delete & View-Once enabled ✅"
+      })
+    }
+
+    // 👁 VIEW ONCE SAVE
+    if (mtype === "viewOnceMessageV2") {
+      const viewOnce = msg.message.viewOnceMessageV2.message
+      await sock.sendMessage(jid, { text: "👁 View-Once saved" })
+      await sock.sendMessage(jid, viewOnce)
+    }
+  })
+
+  // 🚫 ANTI DELETE (TEXT + MEDIA)
+  sock.ev.on("messages.update", async (updates) => {
+    for (const u of updates) {
+      if (u.update?.message === null) {
+        const jid = u.key.remoteJid
+
+        await sock.sendMessage(jid, {
+          text: "🚫 Message deleted but recovered"
+        })
+
+        if (u.message) {
+          const type = getContentType(u.message)
+          if (type !== "conversation") {
+            const buffer = await downloadMediaMessage(
+              u,
+              "buffer",
+              {},
+              { logger: P({ level: "silent" }) }
+            )
+
+            const file = `./deleted/${Date.now()}.${type}`
+            fs.writeFileSync(file, buffer)
+
+            await sock.sendMessage(jid, {
+              document: buffer,
+              fileName: "deleted_media"
+            })
+          }
+        }
+      }
+    }
+  })
+}
+
+startBot()
